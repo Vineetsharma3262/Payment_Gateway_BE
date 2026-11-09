@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: payco-api
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: npm ci && npx prisma generate && npm run build
+    startCommand: npx prisma migrate deploy && node dist/main.js
+    healthCheckPath: /health/live
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_PORT
+        value: 10000
+      - key: LOG_LEVEL
+        value: info
+      - key: SWAGGER_ENABLED
+        value: "true"
+      # Render assigns a URL like https://payco-api-xxxx.onrender.com after the
+      # first deploy — copy it into APP_PUBLIC_BASE_URL in the dashboard then.
+      - key: APP_PUBLIC_BASE_URL
+        sync: false
+      - key: CHECKOUT_BASE_URL
+        value: http://localhost:3000/checkout
+      - key: CORS_ALLOWED_ORIGINS
+        value: http://localhost:3000
+      - key: DASHBOARD_BASE_URL
+        value: http://localhost:3000
+      - key: RATE_LIMIT_TTL_MS
+        value: "60000"
+      - key: RATE_LIMIT_MAX
+        value: "120"
+      - key: ACCESS_TOKEN_TTL_SECONDS
+        value: "900"
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "30"
+      - key: PAYMENT_PROVIDER_DEFAULT
+        value: fake
+      - key: RAZORPAY_API_BASE_URL
+        value: https://api.razorpay.com
+      - key: PROVIDER_HTTP_TIMEOUT_MS
+        value: "10000"
+      - key: AWS_REGION
+        value: us-east-1
+      - key: SECRETS_PROVIDER
+        value: env
+      - key: SECRETS_NAMESPACE
+        value: payco/render-free
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        value: Nimbus <onboarding@resend.dev>
+      # Secrets below are set in the Render dashboard (sync: false keeps them
+      # out of git). Blueprint create will prompt for each one.
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_API_KEY_PEPPER
+        sync: false
+      - key: SECRET_JWT_SIGNING_KEY
+        sync: false
+      - key: SECRET_FIELD_ENCRYPTION_KEYS
+        sync: false
+      - key: SECRET_RESEND_API_KEY
+        sync: false
+      - key: SECRET_RAZORPAY_TEST
+        sync: false
+      - key: SECRET_RAZORPAY_LIVE
+        sync: false

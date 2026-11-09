@@ -1,0 +1,15 @@
+Your {{brand}} password was reset
+
+Hi {{name}},
+
+{{invitedBy}} reset the password on your {{brand}} account.
+
+Sign in at: {{signInUrl}}
+
+  Email:              {{email}}
+  Temporary password: {{temporaryPassword}}
+
+You'll be asked to pick a new password at next sign-in. Didn't request this?
+Contact your admin — the old password is now unusable.
+
+— {{brand}}

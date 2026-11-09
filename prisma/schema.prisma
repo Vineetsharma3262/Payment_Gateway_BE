@@ -1,0 +1,1141 @@
+// PayCo — Phase 1 schema.
+//
+// Ownership: every model lists its owning bounded context. Only the owning
+// module's infrastructure layer may read or write that model; other modules go
+// through the owner's public-api.ts (docs/architecture/module-ownership.md).
+//
+// Money: amounts are BIGINT minor units (cents) + explicit ISO-4217 currency.
+// Constraints that Prisma cannot express (CHECKs, triggers) live in the SQL
+// migration and are documented in docs/architecture/data-model.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ApiMode {
+  test
+  live
+}
+
+enum MerchantStatus {
+  onboarding
+  active
+  suspended
+  closed
+}
+
+// ── Merchant Management ───────────────────────────────────────────────────────
+
+/// Owner: merchants
+model Merchant {
+  id                  String         @id @db.VarChar(40)
+  legalName           String         @map("legal_name") @db.VarChar(200)
+  displayName         String         @map("display_name") @db.VarChar(200)
+  status              MerchantStatus @default(onboarding)
+  liveChargesEnabled  Boolean        @default(false) @map("live_charges_enabled")
+  brandColor          String?        @map("brand_color") @db.VarChar(7)
+  logoUrl             String?        @map("logo_url") @db.VarChar(500)
+  /// Requested descriptor; applied at the gateway only if supported (open question Q3).
+  statementDescriptor String?        @map("statement_descriptor") @db.VarChar(22)
+  paymentMethods      String[]       @default(["card"]) @map("payment_methods")
+  /// Platform-fees context reference; null = default schedule.
+  feeScheduleId       String?        @map("fee_schedule_id") @db.VarChar(40)
+  version             Int            @default(0)
+  createdAt           DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  providerAccounts    MerchantProviderAccount[]
+  apiKeys             ApiKey[]
+  orders              Order[]
+  idempotency         IdempotencyRecord[]
+  memberships         Membership[]
+  invitations         Invitation[]
+  onboarding          OnboardingApplication?
+  profile             MerchantProfile?
+  paymentMethodPrefs  MerchantPaymentMethod[]
+  allowedServices     MerchantAllowedService[]
+  allowedCurrencies   MerchantAllowedCurrency[]
+  descriptors         MerchantDescriptor[]
+  tokenConfig         MerchantTokenConfig?
+  kycConfig           MerchantKycConfig?
+  limitsCharges       MerchantLimitsCharges[]
+  documents           MerchantDocument[]
+  settlementConfigs   SettlementConfig[]
+  settlements         Settlement[]
+  payouts             Payout[]
+  customers           Customer[]
+  blockEntries        BlockEntry[]
+  webhookEndpoints    WebhookEndpoint[]
+  webhookEvents       WebhookEvent[]
+  smartRetryConfig    SmartRetryConfig?
+
+  @@map("merchants")
+}
+
+/// Owner: merchants. Internal reference to the merchant's sub-merchant account at a gateway.
+/// Never exposed through the public API.
+model MerchantProviderAccount {
+  id                String   @id @db.VarChar(40)
+  merchantId        String   @map("merchant_id") @db.VarChar(40)
+  provider          String   @db.VarChar(32)
+  mode              ApiMode
+  providerAccountId String   @map("provider_account_id") @db.VarChar(100)
+  /// Gateway KYB/KYC status as last reported (pending_review | needs_information | approved | rejected).
+  providerStatus    String   @map("provider_status") @db.VarChar(32)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@unique([merchantId, mode])
+  @@unique([provider, mode, providerAccountId])
+  @@map("merchant_provider_accounts")
+}
+
+// ── API Credentials ───────────────────────────────────────────────────────────
+
+/// Owner: api-credentials. Only a keyed hash of the secret is stored; the
+/// plaintext is shown once at creation.
+model ApiKey {
+  id         String    @id @db.VarChar(40)
+  merchantId String    @map("merchant_id") @db.VarChar(40)
+  mode       ApiMode
+  label      String    @db.VarChar(100)
+  secretHash String    @map("secret_hash") @db.VarChar(128)
+  last4      String    @db.VarChar(4)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(3)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@index([merchantId])
+  @@map("api_keys")
+}
+
+// ── Orders ────────────────────────────────────────────────────────────────────
+
+/// Owner: orders
+model Order {
+  id            String   @id @db.VarChar(40)
+  merchantId    String   @map("merchant_id") @db.VarChar(40)
+  mode          ApiMode
+  amountMinor   BigInt   @map("amount_minor")
+  currency      String   @db.Char(3)
+  status        String   @db.VarChar(32)
+  receipt       String?  @db.VarChar(40)
+  notes         Json     @default("{}")
+  failureReason String?  @map("failure_reason") @db.VarChar(500)
+  version       Int      @default(0)
+  createdAt     DateTime @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  // Composite key target so child tables (payments, refunds) can enforce
+  // same-merchant ownership with a composite foreign key.
+  @@unique([merchantId, id])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@map("orders")
+}
+
+// ── Integration mappings ─────────────────────────────────────────────────────
+
+/// Owner: the module that owns `resourceType` writes rows; webhook processing
+/// reads them to resolve provider ids to PayCo ids. Provider ids are stored
+/// here only and never exposed publicly.
+model ProviderResourceMapping {
+  id                 String   @id @db.VarChar(40)
+  merchantId         String   @map("merchant_id") @db.VarChar(40)
+  resourceType       String   @map("resource_type") @db.VarChar(32)
+  resourceId         String   @map("resource_id") @db.VarChar(40)
+  provider           String   @db.VarChar(32)
+  mode               ApiMode
+  providerResourceId String   @map("provider_resource_id") @db.VarChar(100)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([provider, mode, resourceType, providerResourceId])
+  @@unique([resourceType, resourceId, provider])
+  @@index([merchantId])
+  @@map("provider_resource_mappings")
+}
+
+// ── Platform: idempotency and outbox ─────────────────────────────────────────
+
+/// Owner: shared platform. Idempotency keys for financial create operations.
+model IdempotencyRecord {
+  id          String    @id @db.VarChar(40)
+  merchantId  String    @map("merchant_id") @db.VarChar(40)
+  scope       String    @db.VarChar(64)
+  key         String    @db.VarChar(255)
+  requestHash String    @map("request_hash") @db.Char(64)
+  resourceId  String?   @map("resource_id") @db.VarChar(40)
+  /// { kind: 'success', body } | { kind: 'error', code, message, details }
+  outcome     Json?
+  lockedUntil DateTime  @map("locked_until") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@unique([merchantId, scope, key])
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+/// Owner: shared platform. Transactional outbox; relayed to SQS at-least-once.
+model OutboxEvent {
+  id            String    @id @db.VarChar(40)
+  eventType     String    @map("event_type") @db.VarChar(100)
+  aggregateType String    @map("aggregate_type") @db.VarChar(50)
+  aggregateId   String    @map("aggregate_id") @db.VarChar(40)
+  merchantId    String    @map("merchant_id") @db.VarChar(40)
+  payload       Json
+  occurredAt    DateTime  @map("occurred_at") @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt   DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  lastError     String?   @map("last_error") @db.VarChar(1000)
+
+  @@index([publishedAt, nextAttemptAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}
+
+// ── Identity & Access ────────────────────────────────────────────────────────
+
+/// Owner: identity-access
+model User {
+  id               String    @id @db.VarChar(40)
+  /// Stored lower-cased.
+  email            String    @unique @db.VarChar(254)
+  /// Argon2id PHC string.
+  passwordHash     String    @map("password_hash") @db.VarChar(255)
+  /// Display name shown in Users & Roles. Falls back to the email local part.
+  name             String?   @db.VarChar(120)
+  status           String    @default("active") @db.VarChar(16)
+  isPlatformAdmin  Boolean   @default(false) @map("is_platform_admin")
+  /// `super_admin` | `admin` | `staff` — set only for platform users. NULL for
+  /// tenant users. `isPlatformAdmin` stays as a cached boolean (true when
+  /// `platformRole` is `super_admin` or `admin`) so existing authorisation
+  /// checks keep working.
+  platformRole     String?   @map("platform_role") @db.VarChar(32)
+  /// Set for accounts created with an admin-issued password; cleared once the
+  /// user resets it. Mirrors the `invited` status shown in Users & Roles.
+  mustChangePassword Boolean  @default(false) @map("must_change_password")
+  /// Last successful sign-in. Null = never signed in (shows as "Invited" in UI).
+  lastLoginAt      DateTime? @map("last_login_at") @db.Timestamptz(3)
+  emailVerifiedAt  DateTime? @map("email_verified_at") @db.Timestamptz(3)
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  lockedUntil      DateTime? @map("locked_until") @db.Timestamptz(3)
+  /// MFA-ready: factors table arrives with MFA enrolment.
+  mfaEnabled       Boolean   @default(false) @map("mfa_enabled")
+  version          Int       @default(0)
+  createdAt        DateTime  @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @map("updated_at") @db.Timestamptz(3)
+
+  refreshTokens Session[]
+  resetTokens   PasswordResetToken[]
+  memberships   Membership[]
+
+  @@map("users")
+}
+
+/// Owner: identity-access. One row per refresh token; rows sharing `familyId`
+/// form one login session. Reuse of a rotated token revokes the whole family.
+model Session {
+  id         String    @id @db.VarChar(40)
+  userId     String    @map("user_id") @db.VarChar(40)
+  familyId   String    @map("family_id") @db.VarChar(40)
+  merchantId String?   @map("merchant_id") @db.VarChar(40)
+  tokenHash  String    @unique @map("token_hash") @db.Char(64)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  rotatedAt  DateTime? @map("rotated_at") @db.Timestamptz(3)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt  DateTime  @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([familyId])
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/// Owner: identity-access
+model PasswordResetToken {
+  id        String    @id @db.VarChar(40)
+  userId    String    @map("user_id") @db.VarChar(40)
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ── Team Access ──────────────────────────────────────────────────────────────
+
+/// Owner: team-access
+model Membership {
+  id         String   @id @db.VarChar(40)
+  userId     String   @map("user_id") @db.VarChar(40)
+  merchantId String   @map("merchant_id") @db.VarChar(40)
+  role       String   @db.VarChar(32)
+  createdAt  DateTime @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @map("updated_at") @db.Timestamptz(3)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, merchantId])
+  @@index([merchantId])
+  @@map("memberships")
+}
+
+/// Owner: team-access
+model Invitation {
+  id              String    @id @db.VarChar(40)
+  merchantId      String    @map("merchant_id") @db.VarChar(40)
+  email           String    @db.VarChar(254)
+  role            String    @db.VarChar(32)
+  tokenHash       String    @unique @map("token_hash") @db.Char(64)
+  invitedByUserId String    @map("invited_by_user_id") @db.VarChar(40)
+  expiresAt       DateTime  @map("expires_at") @db.Timestamptz(3)
+  acceptedAt      DateTime? @map("accepted_at") @db.Timestamptz(3)
+  revokedAt       DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt       DateTime  @map("created_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@index([merchantId])
+  @@map("invitations")
+}
+
+// ── Merchant Onboarding ──────────────────────────────────────────────────────
+
+/// Owner: merchant-onboarding. Sensitive values (EIN, owner DOB / SSN last 4)
+/// are application-encrypted inside `ein_encrypted` and `owners`.
+model OnboardingApplication {
+  id                      String    @id @db.VarChar(40)
+  merchantId              String    @unique @map("merchant_id") @db.VarChar(40)
+  status                  String    @db.VarChar(32)
+  legalBusinessName       String?   @map("legal_business_name") @db.VarChar(200)
+  doingBusinessAs         String?   @map("doing_business_as") @db.VarChar(200)
+  businessType            String?   @map("business_type") @db.VarChar(32)
+  einEncrypted            String?   @map("ein_encrypted") @db.Text
+  einLast4                String?   @map("ein_last4") @db.VarChar(4)
+  website                 String?   @db.VarChar(300)
+  phone                   String?   @db.VarChar(32)
+  address                 Json?
+  owners                  Json      @default("[]")
+  bankAccount             Json?     @map("bank_account")
+  providerRequirements    Json      @default("[]") @map("provider_requirements")
+  providerTermsAcceptedAt DateTime? @map("provider_terms_accepted_at") @db.Timestamptz(3)
+  submittedAt             DateTime? @map("submitted_at") @db.Timestamptz(3)
+  decidedAt               DateTime? @map("decided_at") @db.Timestamptz(3)
+  rejectionReason         String?   @map("rejection_reason") @db.VarChar(500)
+  version                 Int       @default(0)
+  createdAt               DateTime  @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @map("updated_at") @db.Timestamptz(3)
+
+  merchant  Merchant             @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  documents OnboardingDocument[]
+
+  @@index([status])
+  @@map("onboarding_applications")
+}
+
+/// Owner: merchant-onboarding. References only; bytes live in S3.
+model OnboardingDocument {
+  id            String   @id @db.VarChar(40)
+  merchantId    String   @map("merchant_id") @db.VarChar(40)
+  applicationId String   @map("application_id") @db.VarChar(40)
+  documentType  String   @map("document_type") @db.VarChar(40)
+  storageKey    String   @unique @map("storage_key") @db.VarChar(300)
+  contentType   String   @map("content_type") @db.VarChar(100)
+  status        String   @db.VarChar(20)
+  retainUntil   DateTime @map("retain_until") @db.Timestamptz(3)
+  createdAt     DateTime @map("created_at") @db.Timestamptz(3)
+
+  application OnboardingApplication @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+
+  @@index([merchantId])
+  @@map("onboarding_documents")
+}
+
+// ── Audit and developer logs ─────────────────────────────────────────────────
+
+/// Owner: audit. Append-only (UPDATE/DELETE blocked by trigger).
+model AuditRecord {
+  id           String   @id @db.VarChar(40)
+  merchantId   String?  @map("merchant_id") @db.VarChar(40)
+  actorType    String   @map("actor_type") @db.VarChar(20)
+  actorId      String   @map("actor_id") @db.VarChar(40)
+  action       String   @db.VarChar(100)
+  resourceType String   @map("resource_type") @db.VarChar(50)
+  resourceId   String   @map("resource_id") @db.VarChar(40)
+  requestId    String?  @map("request_id") @db.VarChar(80)
+  metadata     Json     @default("{}")
+  occurredAt   DateTime @map("occurred_at") @db.Timestamptz(3)
+
+  @@index([merchantId, occurredAt(sort: Desc)])
+  @@index([resourceType, resourceId])
+  @@map("audit_records")
+}
+
+/// Owner: api-credentials. Request metadata only — never bodies or headers.
+model ApiRequestLog {
+  id             String   @id @db.VarChar(40)
+  merchantId     String   @map("merchant_id") @db.VarChar(40)
+  apiKeyId       String   @map("api_key_id") @db.VarChar(40)
+  mode           ApiMode
+  method         String   @db.VarChar(8)
+  route          String   @db.VarChar(200)
+  statusCode     Int      @map("status_code")
+  durationMs     Int      @map("duration_ms")
+  requestId      String?  @map("request_id") @db.VarChar(80)
+  idempotencyKey String?  @map("idempotency_key") @db.VarChar(255)
+  createdAt      DateTime @map("created_at") @db.Timestamptz(3)
+
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@map("api_request_logs")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 4: platform domain tables (banks, routing, blocking, error settings,
+// settlements, payouts, customers, webhook deliveries). Each table maps 1:1 to
+// a feature in the Nimbus dashboard; see docs/PRD_Nimbus_Payments.md §6 and
+// Appendix A for the UI → table index.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── Merchant configuration ──────────────────────────────────────────────────
+
+/// Owner: merchants. The "Merchant Details" accordion in the admin merchant
+/// detail page.
+model MerchantProfile {
+  merchantId              String   @id @map("merchant_id") @db.VarChar(40)
+  title                   String?  @db.VarChar(16)
+  contactName             String?  @map("contact_name") @db.VarChar(120)
+  tradingBusinessName     String?  @map("trading_business_name") @db.VarChar(240)
+  tradingAddress          String?  @map("trading_address") @db.VarChar(500)
+  corporateAddress        String?  @map("corporate_address") @db.VarChar(500)
+  tradingCountry          String?  @map("trading_country") @db.VarChar(80)
+  corporateCountry        String?  @map("corporate_country") @db.VarChar(80)
+  tradingState            String?  @map("trading_state") @db.VarChar(80)
+  tradingPostalCode       String?  @map("trading_postal_code") @db.VarChar(16)
+  corporateState          String?  @map("corporate_state") @db.VarChar(80)
+  corporatePostalCode     String?  @map("corporate_postal_code") @db.VarChar(16)
+  businessPhone           String?  @map("business_phone") @db.VarChar(32)
+  contactPhone            String?  @map("contact_phone") @db.VarChar(32)
+  secondaryContactName    String?  @map("secondary_contact_name") @db.VarChar(120)
+  registrationNumber      String?  @map("registration_number") @db.VarChar(60)
+  tradingCommencementDate DateTime? @map("trading_commencement_date") @db.Date
+  dateOfIncorporation     DateTime? @map("date_of_incorporation") @db.Date
+  defaultTimeZone         String   @default("UTC") @map("default_time_zone") @db.VarChar(60)
+  updatedAt               DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("merchant_profiles")
+}
+
+/// Owner: merchants. Ordered selection shown in "Allowed Payment Method".
+model MerchantPaymentMethod {
+  merchantId String @map("merchant_id") @db.VarChar(40)
+  method     String @db.VarChar(40)
+  sortOrder  Int    @map("sort_order")
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@id([merchantId, method])
+  @@index([merchantId, sortOrder])
+  @@map("merchant_payment_methods")
+}
+
+/// Owner: merchants. "Allowed Service" multi-select.
+model MerchantAllowedService {
+  merchantId String @map("merchant_id") @db.VarChar(40)
+  service    String @db.VarChar(32)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@id([merchantId, service])
+  @@map("merchant_allowed_services")
+}
+
+/// Owner: merchants. ISO-4217 codes allowed on this merchant.
+model MerchantAllowedCurrency {
+  merchantId String @map("merchant_id") @db.VarChar(40)
+  currency   String @db.Char(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@id([merchantId, currency])
+  @@map("merchant_allowed_currencies")
+}
+
+/// Owner: merchants. Statement descriptors offered by the merchant.
+model MerchantDescriptor {
+  id         String   @id @db.VarChar(40)
+  merchantId String   @map("merchant_id") @db.VarChar(40)
+  descriptor String   @db.VarChar(80)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, descriptor])
+  @@map("merchant_descriptors")
+}
+
+/// Owner: merchants. "Token as Service" + token access level.
+model MerchantTokenConfig {
+  merchantId        String   @id @map("merchant_id") @db.VarChar(40)
+  tokenAsService    Boolean  @default(false) @map("token_as_service")
+  tokenAccessLevel  String?  @map("token_access_level") @db.VarChar(32)
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("merchant_token_config")
+}
+
+/// Owner: merchants. KYC enforcement knobs set by the merchant's admin.
+model MerchantKycConfig {
+  merchantId            String   @id @map("merchant_id") @db.VarChar(40)
+  required              Boolean  @default(false)
+  minVerificationLevel  String   @default("basic") @map("min_verification_level") @db.VarChar(16)
+  updatedAt             DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("merchant_kyc_config")
+}
+
+/// Owner: merchants. One row per (merchant × currency × payment method). The
+/// Limits/Charges page edits this directly.
+model MerchantLimitsCharges {
+  id             String @id @db.VarChar(40)
+  merchantId     String @map("merchant_id") @db.VarChar(40)
+  currency       String @db.Char(3)
+  paymentMethod  String @map("payment_method") @db.VarChar(40)
+
+  countSuccessHourly       Int @default(0) @map("count_success_hourly")
+  countSuccessDaily        Int @default(0) @map("count_success_daily")
+  countSuccessWeekly       Int @default(0) @map("count_success_weekly")
+  countSuccessMonthly      Int @default(0) @map("count_success_monthly")
+  countRejectedHourly      Int @default(0) @map("count_rejected_hourly")
+  countRejectedDaily       Int @default(0) @map("count_rejected_daily")
+  countRejectedWeekly      Int @default(0) @map("count_rejected_weekly")
+  countRejectedMonthly     Int @default(0) @map("count_rejected_monthly")
+
+  amountTotalHourly        BigInt @default(0) @map("amount_total_hourly")
+  amountTotalDaily         BigInt @default(0) @map("amount_total_daily")
+  amountTotalWeekly        BigInt @default(0) @map("amount_total_weekly")
+  amountTotalMonthly       BigInt @default(0) @map("amount_total_monthly")
+  amountTotalMinimum       BigInt @default(0) @map("amount_total_minimum")
+  amountTotalMaximum       BigInt @default(0) @map("amount_total_maximum")
+  amountRejectedHourly     BigInt @default(0) @map("amount_rejected_hourly")
+  amountRejectedDaily      BigInt @default(0) @map("amount_rejected_daily")
+  amountRejectedWeekly     BigInt @default(0) @map("amount_rejected_weekly")
+  amountRejectedMonthly    BigInt @default(0) @map("amount_rejected_monthly")
+
+  merchantMaxPerDayCount        Int    @default(0) @map("merchant_max_per_day_count")
+  merchantMaxPerDayTotalAmount  BigInt @default(0) @map("merchant_max_per_day_total_amount")
+
+  routeTo String @default("RULE_BASED_ROUTING") @map("route_to") @db.VarChar(32)
+
+  transactionFeeBps     Int    @default(0) @map("transaction_fee_bps")
+  refundFeeMinor        BigInt @default(0) @map("refund_fee_minor")
+  chargebackFeeMinor    BigInt @default(0) @map("chargeback_fee_minor")
+  annualFeeMinor        BigInt @default(0) @map("annual_fee_minor")
+  fraudRefundFeeMinor   BigInt @default(0) @map("fraud_refund_fee_minor")
+  rollingReserveBps     Int    @default(0) @map("rolling_reserve_bps")
+  amountUnit            String @default("MAJOR") @map("amount_unit") @db.VarChar(8)
+  declineFeeMinor       BigInt @default(0) @map("decline_fee_minor")
+
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, currency, paymentMethod])
+  @@map("merchant_limits_charges")
+}
+
+/// Owner: merchants. Bank / officer / other document uploads shown in the
+/// "Download Documents" accordion. Different scope from onboarding_documents.
+model MerchantDocument {
+  id              String   @id @db.VarChar(40)
+  merchantId      String   @map("merchant_id") @db.VarChar(40)
+  /// `bank` | `officer` | `other`.
+  category        String   @db.VarChar(16)
+  fileName        String   @map("file_name") @db.VarChar(255)
+  fileSize        BigInt   @map("file_size")
+  contentType     String   @map("content_type") @db.VarChar(80)
+  storageKey      String   @unique @map("storage_key") @db.VarChar(500)
+  virusScanStatus String   @default("pending") @map("virus_scan_status") @db.VarChar(16)
+  uploadedBy      String?  @map("uploaded_by") @db.VarChar(40)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId, category])
+  @@map("merchant_documents")
+}
+
+// ── Banks & MIDs ────────────────────────────────────────────────────────────
+
+/// Owner: banks. Acquirers / processors PaySecure routes payments through.
+model Bank {
+  id                      String   @id @db.VarChar(40)
+  name                    String   @db.VarChar(120)
+  code                    String   @unique @db.VarChar(16)
+  /// `Processor` | `Acquirer` | `Aggregator`.
+  type                    String   @db.VarChar(16)
+  /// `operational` | `degraded` | `down` | `pending`.
+  status                  String   @db.VarChar(16)
+  enabled                 Boolean  @default(true)
+  address                 String?  @db.VarChar(500)
+  country                 String?  @db.VarChar(80)
+  state                   String?  @db.VarChar(80)
+  city                    String?  @db.VarChar(80)
+  postalCode              String?  @map("postal_code") @db.VarChar(16)
+  email                   String?  @db.VarChar(254)
+  liveApiUrl              String?  @map("live_api_url") @db.VarChar(500)
+  testApiUrl              String?  @map("test_api_url") @db.VarChar(500)
+  allowedCurrency         String?  @map("allowed_currency") @db.Char(3)
+  maxRefundDays           Int      @default(180) @map("max_refund_days")
+  className               String?  @map("class_name") @db.VarChar(120)
+  checkWhitelist          Boolean  @default(false) @map("check_whitelist")
+  isNetworkTokenAllowed   Boolean  @default(false) @map("is_network_token_allowed")
+  /// KMS reference (not the actual value).
+  providerMerchantIdKms   String?  @map("provider_merchant_id_kms") @db.VarChar(255)
+  apiSecretKms            String?  @map("api_secret_kms") @db.VarChar(255)
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt               DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  paymentMethods BankPaymentMethod[]
+  mids           Mid[]
+  cascading      Cascading[]
+  errorMappings  ErrorCodeMapping[]
+
+  @@index([enabled, status])
+  @@map("banks")
+}
+
+/// Owner: banks.
+model BankPaymentMethod {
+  bankId String @map("bank_id") @db.VarChar(40)
+  method String @db.VarChar(40)
+
+  bank Bank @relation(fields: [bankId], references: [id], onDelete: Cascade)
+
+  @@id([bankId, method])
+  @@map("bank_payment_methods")
+}
+
+/// Owner: banks. One MID the bank issued to the platform. The admin "Add MID
+/// (advanced)" dialog edits every column plus `MidExtraField` + `MidAcquirer3DS`.
+model Mid {
+  id                  String   @id @db.VarChar(40)
+  bankId              String   @map("bank_id") @db.VarChar(40)
+  mid                 String   @db.VarChar(60)
+  midName             String?  @map("mid_name") @db.VarChar(120)
+  /// KMS reference.
+  authKeyKms          String   @map("auth_key_kms") @db.VarChar(255)
+  mcc                 String?  @db.Char(4)
+  status              String   @db.VarChar(16)
+  allowedCurrency     String   @default("ALL") @map("allowed_currency") @db.VarChar(16)
+  currencyConversion  Boolean  @default(false) @map("currency_conversion")
+  redirectFromUrl     String?  @map("redirect_from_url") @db.VarChar(500)
+  bankDescriptor      String?  @map("bank_descriptor") @db.VarChar(80)
+  minPerTxn           BigInt   @default(0) @map("min_per_txn")
+  maxPerTxn           BigInt   @default(0) @map("max_per_txn")
+  dailyAmount         BigInt   @default(0) @map("daily_amount")
+  monthlyAmount       BigInt   @default(0) @map("monthly_amount")
+  dailyCount          Int      @default(0) @map("daily_count")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  bank           Bank                @relation(fields: [bankId], references: [id], onDelete: Cascade)
+  paymentMethods MidPaymentMethod[]
+  extraFields    MidExtraField[]
+  acquirer3DS    MidAcquirer3DS?
+
+  @@unique([bankId, mid])
+  @@map("mids")
+}
+
+/// Owner: banks.
+model MidPaymentMethod {
+  midId  String @map("mid_id") @db.VarChar(40)
+  method String @db.VarChar(40)
+
+  mid Mid @relation(fields: [midId], references: [id], onDelete: Cascade)
+
+  @@id([midId, method])
+  @@map("mid_payment_methods")
+}
+
+/// Owner: banks. Custom key/value pairs the integration layer passes through
+/// to the processor on every call. Values are application-encrypted at rest.
+model MidExtraField {
+  id         String   @id @db.VarChar(40)
+  midId      String   @map("mid_id") @db.VarChar(40)
+  fieldName  String   @map("field_name") @db.VarChar(80)
+  fieldValue Bytes    @map("field_value")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  mid Mid @relation(fields: [midId], references: [id], onDelete: Cascade)
+
+  @@unique([midId, fieldName])
+  @@map("mid_extra_fields")
+}
+
+/// Owner: banks. External-3DS acquirer info set per MID.
+model MidAcquirer3DS {
+  midId              String   @id @map("mid_id") @db.VarChar(40)
+  bin                String?  @db.VarChar(16)
+  merchantIdentifier String?  @map("merchant_identifier") @db.VarChar(60)
+  country            String?  @db.VarChar(80)
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  mid Mid @relation(fields: [midId], references: [id], onDelete: Cascade)
+
+  @@map("mid_acquirer_3ds")
+}
+
+/// Owner: banks. Singleton (`id = 1`). The full video "Global MID Settings"
+/// payload lives in `configJson`; column-exploded CRUD arrives in Phase 5.
+model GlobalMidLimits {
+  id                        Int      @id @default(1)
+  minimumHitIntervalMinutes Int      @default(-1) @map("minimum_hit_interval_minutes")
+  configJson                Json     @map("config_json")
+  updatedAt                 DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("global_mid_limits")
+}
+
+// ── Routing & rules ─────────────────────────────────────────────────────────
+
+/// Owner: routing.
+model RuleCategory {
+  id         String   @id @db.VarChar(40)
+  name       String   @unique @db.VarChar(120)
+  type       String   @db.VarChar(60)
+  sortOrder  Int      @map("sort_order")
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  rules RoutingRule[]
+
+  @@map("rule_categories")
+}
+
+/// Owner: routing. `conditions` and `targets` are JSON for Phase 4; a typed
+/// child-table design arrives if the rule engine moves fully in-house.
+model RoutingRule {
+  id             String   @id @db.VarChar(40)
+  categoryId     String   @map("category_id") @db.VarChar(40)
+  name           String   @db.VarChar(120)
+  description    String?  @db.Text
+  descriptor     String?  @db.Text
+  priority       Int
+  enabled        Boolean  @default(true)
+  conditionsJson Json     @map("conditions_json")
+  targetsJson    Json     @map("targets_json")
+  createdBy      String?  @map("created_by") @db.VarChar(40)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  category RuleCategory       @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  tags     RoutingRuleTag[]
+
+  @@index([categoryId, priority])
+  @@map("routing_rules")
+}
+
+/// Owner: routing.
+model RoutingRuleTag {
+  ruleId String @map("rule_id") @db.VarChar(40)
+  tag    String @db.VarChar(60)
+
+  rule RoutingRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@id([ruleId, tag])
+  @@map("routing_rule_tags")
+}
+
+/// Owner: routing. Singleton for the global card-validation modal.
+model CardValidationRules {
+  id         Int      @id @default(1)
+  rulesJson  Json     @map("rules_json")
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("card_validation_rules")
+}
+
+/// Owner: routing. Per-merchant smart-retry policy + category selection list.
+model SmartRetryConfig {
+  merchantId             String   @id @map("merchant_id") @db.VarChar(40)
+  enabled                Boolean  @default(false)
+  maxAttempts            Int      @default(2) @map("max_attempts")
+  retryOnDifferentMid    Boolean  @default(true) @map("retry_on_different_mid")
+  retryWindowSeconds     Int      @default(300) @map("retry_window_seconds")
+  retryableCodes         Json     @default("[]") @map("retryable_codes")
+  excludedMethods        Json     @default("[]") @map("excluded_methods")
+  selectedCategoryIds    Json     @default("[]") @map("selected_category_ids")
+  updatedAt              DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("smart_retry_config")
+}
+
+/// Owner: routing. (bank, processor_code) → list of banks allowed to receive
+/// cascaded traffic.
+model Cascading {
+  bankId         String   @map("bank_id") @db.VarChar(40)
+  processorCode  String   @map("processor_code") @db.VarChar(60)
+  allowedBanks   Json     @map("allowed_banks")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  bank Bank @relation(fields: [bankId], references: [id], onDelete: Cascade)
+
+  @@id([bankId, processorCode])
+  @@map("cascading")
+}
+
+// ── Blocking & error settings ───────────────────────────────────────────────
+
+/// Owner: blocking. One table for every blocking type the UI exposes.
+model BlockEntry {
+  id                   String    @id @db.VarChar(40)
+  /// `card` | `bin` | `customer` | `mid` | `ip` | `country` | `email`.
+  type                 String    @db.VarChar(16)
+  value                String    @db.VarChar(255)
+  /// `merchant` | `all`.
+  scope                String    @db.VarChar(16)
+  merchantId           String?   @map("merchant_id") @db.VarChar(40)
+  /// `manual` | `rule` | `import`.
+  source               String    @db.VarChar(16)
+  reason               String?   @db.VarChar(255)
+  triggeredByRuleId    String?   @map("triggered_by_rule_id") @db.VarChar(40)
+  expiresAt            DateTime? @map("expires_at") @db.Timestamptz(3)
+  addedBy              String?   @map("added_by") @db.VarChar(40)
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  removedAt            DateTime? @map("removed_at") @db.Timestamptz(3)
+
+  merchant Merchant? @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([type, expiresAt])
+  @@index([merchantId, type])
+  @@map("block_entries")
+}
+
+/// Owner: error-settings. Bank × processor code mapping.
+model ErrorCodeMapping {
+  id             String   @id @db.VarChar(40)
+  bankId         String   @map("bank_id") @db.VarChar(40)
+  paysecureCode  String   @map("paysecure_code") @db.VarChar(60)
+  processorCode  String   @map("processor_code") @db.VarChar(60)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  bank Bank @relation(fields: [bankId], references: [id], onDelete: Cascade)
+
+  @@unique([bankId, paysecureCode])
+  @@map("error_code_mappings")
+}
+
+/// Owner: error-settings.
+model ErrorCategory {
+  id        String   @id @db.VarChar(40)
+  name      String   @unique @db.VarChar(120)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  mappings ErrorCategoryMapping[]
+
+  @@map("error_categories")
+}
+
+/// Owner: error-settings. One category per paysecure code.
+model ErrorCategoryMapping {
+  id             String   @id @db.VarChar(40)
+  paysecureCode  String   @unique @map("paysecure_code") @db.VarChar(60)
+  categoryId     String   @map("category_id") @db.VarChar(40)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  category ErrorCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@map("error_category_mappings")
+}
+
+/// Owner: error-settings. Threshold-driven actions ("Add Error Code Action").
+model ErrorCodeAction {
+  id                   String   @id @db.VarChar(40)
+  name                 String   @db.VarChar(120)
+  processor            String   @default("Any processor") @db.VarChar(60)
+  errorCodes           Json     @map("error_codes")
+  /// `Include` | `Exclude`.
+  appliesTo            String   @default("Include") @map("applies_to") @db.VarChar(16)
+  binRanges            Json     @default("[]") @map("bin_ranges")
+  thresholdErrors      Int      @map("threshold_errors")
+  thresholdWindow      Int      @map("threshold_window")
+  /// `minutes` | `hours` | `days`.
+  thresholdUnit        String   @map("threshold_unit") @db.VarChar(8)
+  /// `Block` | `Retry again`.
+  action               String   @db.VarChar(16)
+  blockTarget          String   @map("block_target") @db.VarChar(16)
+  blockScope           String   @map("block_scope") @db.VarChar(16)
+  cooldownMinutes      Int      @map("cooldown_minutes")
+  amountCheckEnabled   Boolean  @default(false) @map("amount_check_enabled")
+  amountMinMinor       BigInt   @default(0) @map("amount_min_minor")
+  amountMaxMinor       BigInt   @default(0) @map("amount_max_minor")
+  enabled              Boolean  @default(true)
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("error_code_actions")
+}
+
+// ── Settlements ─────────────────────────────────────────────────────────────
+
+/// Owner: settlements. Per-merchant × per-method settlement policy. Several
+/// fields in this table are "set only once" per PRD §4.13 — the backend
+/// enforces that at the application layer.
+model SettlementConfig {
+  id                       String   @id @db.VarChar(40)
+  merchantId               String   @map("merchant_id") @db.VarChar(40)
+  paymentMethod            String   @map("payment_method") @db.VarChar(40)
+  settlementFee            Decimal  @default(0) @map("settlement_fee") @db.Decimal(10, 4)
+  /// `Fixed` | `Percent`.
+  settlementFeeKind        String   @default("Fixed") @map("settlement_fee_kind") @db.VarChar(16)
+  startDate                DateTime? @map("start_date") @db.Date
+  lastSettlementDate       DateTime? @map("last_settlement_date") @db.Date
+  lastRunOn                DateTime? @map("last_run_on") @db.Date
+  maxRr                    Int      @default(-1) @map("max_rr")
+  releasedFrequency        String   @default("Default") @map("released_frequency") @db.VarChar(16)
+  settlementCurrency       String?  @map("settlement_currency") @db.Char(3)
+  minimumPayoutMinor       BigInt   @default(0) @map("minimum_payout_minor")
+  tPlusDays                Int      @default(0) @map("t_plus_days")
+  rollingPeriodDays        Int      @default(0) @map("rolling_period_days")
+  rollingReservePctBps     Int      @default(0) @map("rolling_reserve_pct_bps")
+  settlementRiskFactor     Decimal  @default(0) @map("settlement_risk_factor") @db.Decimal(5, 2)
+  /// `Month Days` | `Week Days` | `Hours` | `Minutes`.
+  frequencyType            String?  @map("frequency_type") @db.VarChar(16)
+  settlementFrequency      Json?    @map("settlement_frequency")
+  payoutStartDate          DateTime? @map("payout_start_date") @db.Date
+  payoutStartDateLocked    Boolean  @default(false) @map("payout_start_date_locked")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, paymentMethod])
+  @@map("settlement_configs")
+}
+
+/// Owner: settlements. Historical settlement rows the Settlement Report page
+/// renders.
+model Settlement {
+  id                   String   @id @db.VarChar(40)
+  merchantId           String   @map("merchant_id") @db.VarChar(40)
+  paymentMethod        String   @map("payment_method") @db.VarChar(40)
+  orderStartDate       DateTime @map("order_start_date") @db.Timestamptz(3)
+  orderEndDate         DateTime @map("order_end_date") @db.Timestamptz(3)
+  settlementDate       DateTime? @map("settlement_date") @db.Timestamptz(3)
+  grossAmountMinor     BigInt   @map("gross_amount_minor")
+  settlementFeeMinor   BigInt   @map("settlement_fee_minor")
+  netAmountMinor       BigInt   @map("net_amount_minor")
+  payableAmountMinor   BigInt   @map("payable_amount_minor")
+  currency             String   @db.Char(3)
+  /// `pending` | `settled` | `failed`.
+  status               String   @db.VarChar(16)
+  utr                  String?  @db.VarChar(60)
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant         @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  items    SettlementItem[]
+
+  @@index([merchantId, settlementDate])
+  @@map("settlements")
+}
+
+/// Owner: settlements.
+model SettlementItem {
+  id            String  @id @db.VarChar(40)
+  settlementId  String  @map("settlement_id") @db.VarChar(40)
+  paymentId     String? @map("payment_id") @db.VarChar(40)
+  refundId      String? @map("refund_id") @db.VarChar(40)
+  chargebackId  String? @map("chargeback_id") @db.VarChar(40)
+  /// `payment` | `refund` | `chargeback` | `fee` | `reserve`.
+  kind          String  @db.VarChar(16)
+  /// Signed; refunds and reserves are negative.
+  amountMinor   BigInt  @map("amount_minor")
+  description   String? @db.VarChar(255)
+
+  settlement Settlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+
+  @@index([settlementId])
+  @@map("settlement_items")
+}
+
+// ── Payouts ─────────────────────────────────────────────────────────────────
+
+/// Owner: payouts. Statuses follow the PRD lifecycle:
+/// `queued → pending → processing → processed | reversed | rejected | failed`.
+model Payout {
+  id                       String   @id @db.VarChar(40)
+  merchantId               String   @map("merchant_id") @db.VarChar(40)
+  /// `IMPS` | `NEFT` | `RTGS` | `UPI` | `SWIFT` | `SEPA` | `ACH` | `WIRE` |
+  /// `WALLET` | `VIRTUAL-ACCOUNT` | `PAYOUT-BANKTRANSFER`.
+  mode                     String   @db.VarChar(32)
+  /// `vendor_bill` | `refund` | `salary` | `cashback` | `payout`.
+  purpose                  String   @db.VarChar(32)
+  status                   String   @db.VarChar(16)
+  amountMinor              BigInt   @map("amount_minor")
+  feeMinor                 BigInt   @default(0) @map("fee_minor")
+  taxMinor                 BigInt   @default(0) @map("tax_minor")
+  currency                 String   @db.Char(3)
+  beneficiaryName          String   @map("beneficiary_name") @db.VarChar(240)
+  beneficiaryBank          String?  @map("beneficiary_bank") @db.VarChar(120)
+  beneficiaryAccountLast4  String?  @map("beneficiary_account_last4") @db.Char(4)
+  beneficiaryIfsc          String?  @map("beneficiary_ifsc") @db.VarChar(16)
+  beneficiaryVpa           String?  @map("beneficiary_vpa") @db.VarChar(80)
+  referenceId              String?  @map("reference_id") @db.VarChar(60)
+  utr                      String?  @db.VarChar(60)
+  failureReason            String?  @map("failure_reason") @db.VarChar(255)
+  /// `beneficiary_bank` | `business` | `internal`.
+  statusSource             String?  @map("status_source") @db.VarChar(32)
+  idempotencyKey           String?  @map("idempotency_key") @db.VarChar(64)
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  processedAt              DateTime? @map("processed_at") @db.Timestamptz(3)
+
+  merchant Merchant      @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  events   PayoutEvent[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@map("payouts")
+}
+
+/// Owner: payouts. Append-only lifecycle events for the detail-sheet timeline.
+model PayoutEvent {
+  id          BigInt   @id @default(autoincrement())
+  payoutId    String   @map("payout_id") @db.VarChar(40)
+  eventType   String   @map("event_type") @db.VarChar(60)
+  payloadJson Json     @map("payload_json")
+  /// `system` | `admin` | `merchant` | `paysecure`.
+  source      String   @db.VarChar(16)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+
+  @@index([payoutId, createdAt])
+  @@map("payout_events")
+}
+
+// ── Customers ───────────────────────────────────────────────────────────────
+
+/// Owner: customers. One row per (merchant × email). Used by velocity rules
+/// and blocking, and shown on the Customers page.
+model Customer {
+  id         String   @id @db.VarChar(40)
+  merchantId String   @map("merchant_id") @db.VarChar(40)
+  name       String?  @db.VarChar(240)
+  email      String?  @db.VarChar(254)
+  phone      String?  @db.VarChar(32)
+  country    String?  @db.Char(2)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, email])
+  @@index([merchantId])
+  @@map("customers")
+}
+
+/// Owner: identity-access. Per-user saved filter views on list pages.
+model SavedView {
+  id            String   @id @db.VarChar(40)
+  ownerUserId   String   @map("owner_user_id") @db.VarChar(40)
+  /// `transactions` | `payouts` | `settlements`.
+  scope         String   @db.VarChar(32)
+  name          String   @db.VarChar(120)
+  filtersJson   Json     @map("filters_json")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([ownerUserId, scope, name])
+  @@map("saved_views")
+}
+
+// ── Webhook deliveries ──────────────────────────────────────────────────────
+
+/// Owner: webhooks. The merchant's receiving endpoint. Secret stays hashed.
+model WebhookEndpoint {
+  id                String   @id @db.VarChar(40)
+  merchantId        String   @map("merchant_id") @db.VarChar(40)
+  environment       ApiMode  @map("environment")
+  url               String   @db.VarChar(500)
+  secretHash        String   @map("secret_hash") @db.Char(64)
+  subscribedEvents  Json     @map("subscribed_events")
+  disabledAt        DateTime? @map("disabled_at") @db.Timestamptz(3)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  merchant   Merchant           @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([merchantId, environment])
+  @@map("webhook_endpoints")
+}
+
+/// Owner: webhooks.
+model WebhookEvent {
+  id          String   @id @db.VarChar(40)
+  merchantId  String   @map("merchant_id") @db.VarChar(40)
+  eventType   String   @map("event_type") @db.VarChar(60)
+  payloadJson Json     @map("payload_json")
+  liveMode    Boolean  @default(true) @map("live_mode")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  merchant   Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([merchantId, createdAt])
+  @@map("webhook_events")
+}
+
+/// Owner: webhooks. One row per attempt.
+model WebhookDelivery {
+  id             String    @id @db.VarChar(40)
+  webhookEventId String    @map("webhook_event_id") @db.VarChar(40)
+  endpointId     String    @map("endpoint_id") @db.VarChar(40)
+  attempt        Int
+  httpStatus     Int?      @map("http_status")
+  responseBody   String?   @map("response_body") @db.VarChar(2000)
+  startedAt      DateTime  @map("started_at") @db.Timestamptz(3)
+  finishedAt     DateTime? @map("finished_at") @db.Timestamptz(3)
+  nextRetryAt    DateTime? @map("next_retry_at") @db.Timestamptz(3)
+  succeeded      Boolean   @default(false)
+
+  event    WebhookEvent    @relation(fields: [webhookEventId], references: [id], onDelete: Cascade)
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([webhookEventId, attempt])
+  @@index([endpointId, startedAt])
+  @@map("webhook_deliveries")
+}

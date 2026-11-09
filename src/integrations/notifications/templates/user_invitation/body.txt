@@ -1,0 +1,16 @@
+You're invited to {{brand}}
+
+Hi {{name}},
+
+{{invitedBy}} added you to the {{brand}} dashboard.
+
+Sign in at: {{signInUrl}}
+
+  Email:              {{email}}
+  Temporary password: {{temporaryPassword}}
+
+You'll be asked to pick a new password on first sign-in. Didn't expect this
+invitation? You can safely ignore this email — no access is granted until you
+sign in.
+
+— {{brand}}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "deleteOutDir": true,
+    "tsConfigPath": "tsconfig.build.json",
+    "assets": [
+      {
+        "include": "integrations/notifications/templates/**/*",
+        "exclude": "integrations/notifications/templates/README.md",
+        "watchAssets": true
+      }
+    ]
+  }
+}

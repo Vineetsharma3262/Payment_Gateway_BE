@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Your {{brand}} password was reset</title></head>
+  <body style="margin:0;padding:0;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#111827;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:32px 16px;">
+      <tr><td align="center">
+        <table role="presentation" width="520" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;box-shadow:0 1px 3px rgba(16,24,40,0.08);overflow:hidden;">
+          <tr><td style="padding:28px 32px 20px;border-bottom:1px solid #eef0f5;font-size:18px;font-weight:600;">{{brand}}</td></tr>
+          <tr><td style="padding:28px 32px;">
+            <h1 style="margin:0 0 12px;font-size:20px;line-height:1.3;font-weight:600;">Your password was reset</h1>
+            <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#374151;">
+              Hi {{name}}, {{invitedBy}} reset the password on your {{brand}}
+              account. Sign in with the temporary password below — you'll be
+              asked to pick a new one at next sign-in.
+            </p>
+            <div style="margin:20px 0;padding:16px;border:1px solid #eef0f5;border-radius:8px;background:#fafbff;">
+              <div style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#6b7280;margin-bottom:4px;">Temporary password</div>
+              <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:16px;font-weight:600;color:#111827;">{{temporaryPassword}}</div>
+            </div>
+            <p style="margin:16px 0;">
+              <a href="{{signInUrl}}" style="display:inline-block;background:#2a78d6;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:8px;font-size:14px;font-weight:600;">Sign in to {{brand}}</a>
+            </p>
+            <p style="margin:16px 0 0;font-size:12px;line-height:1.6;color:#6b7280;">
+              Didn't request this? Reply to this message or contact your admin — the
+              old password is now unusable.
+            </p>
+          </td></tr>
+          <tr><td style="padding:16px 32px 24px;border-top:1px solid #eef0f5;font-size:12px;color:#6b7280;">
+            Sent by {{brand}}.
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>

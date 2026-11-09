@@ -1,0 +1,15 @@
+Reset your {{brand}} password
+
+Hi {{name}},
+
+We received a request to reset the password for {{email}}.
+
+Open this link to pick a new password (expires in {{expiresInMinutes}} minutes
+and can be used once):
+
+    {{resetUrl}}
+
+Didn't request this? You can safely ignore this email — your password will not
+change.
+
+— {{brand}}

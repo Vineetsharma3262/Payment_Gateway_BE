@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: payco
+          POSTGRES_PASSWORD: payco_ci_password
+          POSTGRES_DB: payco_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U payco -d payco_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://payco:payco_ci_password@localhost:5432/payco_test?schema=public
+      INTEGRATION_DATABASE_URL: postgresql://payco:payco_ci_password@localhost:5432/payco_test?schema=public
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma validate
+      - run: npx prisma generate
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Format
+        run: npm run format:check
+      - name: Unit + architecture tests
+        run: npm test -- --ci
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+      - name: Integration tests
+        run: npm run test:integration -- --ci
+      - name: E2E tests
+        run: npm run test:e2e -- --ci
+      - name: Build
+        run: npm run build
+      - name: Docker image builds
+        run: docker build -t payco-backend:ci .

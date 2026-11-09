@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+!.env.test.example
+*.log
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+# never commit real exports, reports or onboarding documents
+/data/
+/tmp/
