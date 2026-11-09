@@ -188,7 +188,8 @@ supported by the publisher (`MessageGroupId` = aggregate) where per-aggregate or
   outside dev), 100 kB JSON body limit, `trust proxy` = 1 hop.
 - **Rate limiting**: per API key id (else per IP), Redis-backed across instances.
 - **Logging**: pino with redaction of auth headers, signatures, secrets and financial identifiers;
-  bodies and query strings are never logged; every log line carries the request id.
+  bodies and query strings are never logged; every log line carries the request id. `pino-pretty`
+  is used only in development when that package is installed; deployed images log JSON to stdout.
 - **Webhook signatures** are verified against the raw body (`rawBody: true`) before parsing.
 - **Configuration**: staging/production refuse env-file secrets, the fake provider, missing Redis,
   non-https CORS origins and the public Swagger UI.

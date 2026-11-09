@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { LoggerModule } from 'nestjs-pino';
 import { APP_CONFIG, type AppConfig } from '../../../config/configuration';
 import { resolveRequestId } from '../observability/request-id';
+import { developmentLogTransport } from './pino-transport';
 import { REDACTED_LOG_PATHS } from './redaction';
 
 @Module({
@@ -23,10 +24,7 @@ import { REDACTED_LOG_PATHS } from './redaction';
             }),
             res: (res: { statusCode: number }) => ({ statusCode: res.statusCode }),
           },
-          transport:
-            config.env === 'development'
-              ? { target: 'pino-pretty', options: { singleLine: true } }
-              : undefined,
+          transport: developmentLogTransport(config.env),
         },
       }),
     }),
